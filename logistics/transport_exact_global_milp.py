@@ -14,7 +14,7 @@ from openpyxl.utils import get_column_letter
 from scipy.optimize import milp, LinearConstraint, Bounds
 
 BASE = Path(__file__).parent
-INPUT_XLSX = BASE / "solver.xlsx"
+INPUT_XLSX = BASE.parent / "solver.xlsx"
 
 # -----------------------------
 # Generic helpers
@@ -656,24 +656,29 @@ def build_outputs(input_path: Path):
     return outputs
 
 def export_outputs(outputs: Dict[str, pd.DataFrame]):
-    # CSV
+    out_dir = BASE / "baseline_output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # CSVs -> baseline_output/csv/
+    csv_dir = out_dir / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
     csv_map = {
-        "US": BASE / "transport_us_exact_milp.csv",
-        "UK": BASE / "transport_uk_exact_milp.csv",
-        "AU": BASE / "transport_au_exact_milp.csv",
-        "US_Detail": BASE / "transport_us_detail_exact_milp.csv",
-        "UK_Detail": BASE / "transport_uk_detail_exact_milp.csv",
-        "AU_Detail": BASE / "transport_au_detail_exact_milp.csv",
-        "All_Load_Detail": BASE / "transport_all_load_detail_exact_milp.csv",
-        "Weekly_All_Markets": BASE / "transport_weekly_all_markets_exact_milp.csv",
-        "Summary_Market": BASE / "transport_summary_market_exact_milp.csv",
-        "Summary_All": BASE / "transport_summary_all_exact_milp.csv",
+        "US": csv_dir / "transport_us_exact_milp.csv",
+        "UK": csv_dir / "transport_uk_exact_milp.csv",
+        "AU": csv_dir / "transport_au_exact_milp.csv",
+        "US_Detail": csv_dir / "transport_us_detail_exact_milp.csv",
+        "UK_Detail": csv_dir / "transport_uk_detail_exact_milp.csv",
+        "AU_Detail": csv_dir / "transport_au_detail_exact_milp.csv",
+        "All_Load_Detail": csv_dir / "transport_all_load_detail_exact_milp.csv",
+        "Weekly_All_Markets": csv_dir / "transport_weekly_all_markets_exact_milp.csv",
+        "Summary_Market": csv_dir / "transport_summary_market_exact_milp.csv",
+        "Summary_All": csv_dir / "transport_summary_all_exact_milp.csv",
     }
     for key, path in csv_map.items():
         outputs[key].to_csv(path, index=False)
 
-    # Excel
-    out_xlsx = BASE / "transport_output_exact_milp.xlsx"
+    # Excel -> baseline_output/
+    out_xlsx = out_dir / "transport_output_baseline.xlsx"
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -708,21 +713,8 @@ def main():
         raise FileNotFoundError(f"Input file not found: {INPUT_XLSX}")
     outputs = build_outputs(INPUT_XLSX)
     xlsx_path = export_outputs(outputs)
-    print("Created exact MILP outputs:")
-    for name in [
-        "transport_us_exact_milp.csv",
-        "transport_uk_exact_milp.csv",
-        "transport_au_exact_milp.csv",
-        "transport_us_detail_exact_milp.csv",
-        "transport_uk_detail_exact_milp.csv",
-        "transport_au_detail_exact_milp.csv",
-        "transport_all_load_detail_exact_milp.csv",
-        "transport_weekly_all_markets_exact_milp.csv",
-        "transport_summary_market_exact_milp.csv",
-        "transport_summary_all_exact_milp.csv",
-        "transport_output_exact_milp.xlsx",
-    ]:
-        print(BASE / name)
+    print(f"  -> {xlsx_path.relative_to(BASE)}")
+    print(f"  -> baseline_output/csv/ (10 files)")
 
 if __name__ == "__main__":
     main()

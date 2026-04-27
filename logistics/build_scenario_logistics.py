@@ -1,25 +1,36 @@
 """
-Build scenario logistics solver input + Monthly Cost Report
-============================================================
-1. Creates solver_scenario.xlsx from BOM_demand_Scenario (SKU A & B only)
-2. Runs the MILP transport solver
-3. Outputs monthly_logistics_cost.xlsx combining scenario vs baseline
+Build FULL scenario logistics — all 6 SKUs (A–F), all markets (US/UK/AU)
+========================================================================
+1. Reads BOM_demand_Scenario  (columns A–F)  +  FGs & Log information
+   from the scenario MPS_MRP workbook.
+2. Builds solver_scenario.xlsx in the EXACT same format as solver.xlsx
+   so that transport_exact_global_milp.py can consume it directly.
+3. Runs the MILP transport solver (reuses build_outputs / export_outputs).
+4. Saves ALL outputs (CSVs + Excel) into  logistics/scenario_output/
+   with the same file names as the baseline, making comparison trivial.
+5. Generates a monthly_logistics_cost.xlsx cost report (scenario vs baseline).
 """
 
+from __future__ import annotations
+
 import math
-import pandas as pd
+import sys
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List
+
+import pandas as pd
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from datetime import datetime
 
-BASE        = Path(__file__).parent
-MPS_MRP     = BASE / "SCM_round2.1_scenario_MPS_MRP.xlsx"
-ORIG_SOLVER = BASE / "solver.xlsx" if (BASE / "solver.xlsx").exists() else None
-OUTPUT_XLSX = BASE / "transport_output_scenario_v2.xlsx"
-MONTHLY_OUT = BASE / "monthly_logistics_cost.xlsx"
-SCENARIO_SOLVER = BASE / "solver_scenario.xlsx"
+# ── Paths ───────────────────────────────────────────────────
+BASE         = Path(__file__).parent
+MPS_MRP      = BASE / "SCM_round2.1_scenario_MPS_MRP.xlsx"
+ORIG_SOLVER  = BASE / "solver.xlsx"          # baseline, for reference
+OUT_DIR      = BASE / "scenario_output"       # ← separate output folder
+SCENARIO_SOLVER = OUT_DIR / "solver_scenario.xlsx"
+MONTHLY_OUT     = OUT_DIR / "monthly_logistics_cost.xlsx"
 
 # ── Styles ──────────────────────────────────────────────────
 NAVY   = PatternFill("solid", fgColor="1F4E78")
@@ -33,6 +44,13 @@ BLD    = Font(bold=True)
 THIN   = Side(style="thin", color="BFBFBF")
 BDR    = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
+ALL_SKUS   = ["A", "B", "C", "D", "E", "F"]
+ALL_MARKETS = ["US", "UK", "AU"]
+
+
+# ─────────────────────────────────────────────────────────────
+#  STEP 1 — Build solver_scenario.xlsx  (same format as solver.xlsx)
+# ─────────────────────────────────────────────────────────────
 
 def styled_hdr(ws, row, headers, fill=ORANGE):
     for c, h in enumerate(headers, 1):
@@ -49,87 +67,99 @@ def auto_width(ws, max_w=22):
         ws.column_dimensions[letter].width = min(max(w + 3, 10), max_w)
 
 
-def build_scenario_solver_xlsx():
+def build_scenario_solver_xlsx() -> Path:
     """
     Build solver_scenario.xlsx that transport_exact_global_milp.py can read.
-    Structure: one sheet with SKU master + Lane params + Decision table (A & B demand).
+    Exact same layout as solver.xlsx:
+      Section 1 – SKU Master  (Item name / Des / Packing size / CBM / Price / Market)
+      Section 2 – Lane Parameters (Market / Mode / Cost / Cap_CBM)
+      Section 3 – Decision Table  (Week / A / B / C / D / E / F)
     """
-    print("[1/4] Reading BOM_demand_Scenario from MPS_MRP file ...")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    print("[1/4] Reading BOM_demand_Scenario  +  FGs & Log information …")
 
-    # Read BOM_demand_Scenario – weekly production by SKU (A, B)
-    bom_df = pd.read_excel(MPS_MRP, sheet_name="BOM_demand_Scenario", header=None)
-    # Row 0 = header
-    header = [str(bom_df.iloc[0, c]) for c in range(bom_df.shape[1])]
-    week_col   = header.index("Week")
-    a_col      = header.index("A")
-    b_col      = header.index("B")
-
-    from datetime import timedelta
-    SHIP_MIN = pd.Timestamp("2026-04-27")   # first valid ship date
-    weekly_rows = []
-    for r in range(1, bom_df.shape[0]):
-        wk = bom_df.iloc[r, week_col]
-        if pd.isna(wk): break
-        # Shipment date = production week + 7 days
-        wk_ship = pd.Timestamp(wk) + timedelta(days=7)
-        if wk_ship < SHIP_MIN:
-            continue   # skip — too early to ship
-        a_qty = int(float(bom_df.iloc[r, a_col] or 0))
-        b_qty = int(float(bom_df.iloc[r, b_col] or 0))
-        weekly_rows.append({"Week": wk_ship, "A": a_qty, "B": b_qty})
-
-    print(f"    Found {len(weekly_rows)} weekly rows")
-    print("    Ship date range: {} -> {} (+7d offset)".format(
-        weekly_rows[0]['Week'].date(), weekly_rows[-1]['Week'].date()))
-
-
-
-    # Read FGs info (SKU master) from MPS_MRP
+    # ── Read FGs & Log information (SKU master) ─────────────
     fgs_df = pd.read_excel(MPS_MRP, sheet_name="FGs & Log information ", header=None)
-    # Find header row (row 1)
-    sku_master = []
-    for r in range(2, 8):
-        item = str(fgs_df.iloc[r, 1]).strip()
-        if item in ("A", "B"):  # Only A and B for this scenario
-            desc      = str(fgs_df.iloc[r, 2])
-            pack_size = int(float(fgs_df.iloc[r, 3]))
-            cbm100    = float(fgs_df.iloc[r, 4])
-            price     = float(fgs_df.iloc[r, 5])
-            market    = str(fgs_df.iloc[r, 6]).strip()
-            sku_master.append({
-                "Item name": item, "Des": desc,
-                "Packing size (pcs/ carton)": pack_size,
-                " CBM (100 cartons) ": cbm100,
-                "Ex. Work price (Usd/pcs)": price,
-                "Market ": market
-            })
-
+    sku_master: list[dict] = []
+    for r in range(2, fgs_df.shape[0]):
+        item = fgs_df.iloc[r, 1]
+        if pd.isna(item) or str(item).strip() == "":
+            if sku_master:
+                break
+            continue
+        item = str(item).strip()
+        if item not in ALL_SKUS:
+            continue
+        desc      = str(fgs_df.iloc[r, 2])
+        pack_size = int(float(fgs_df.iloc[r, 3]))
+        cbm100    = float(fgs_df.iloc[r, 4])
+        price     = float(fgs_df.iloc[r, 5])
+        market    = str(fgs_df.iloc[r, 6]).strip()
+        sku_master.append({
+            "Item name": item,
+            "Des": desc,
+            "Packing size (pcs/carton)": pack_size,
+            "CBM (100 cartons)": cbm100,
+            "Ex. Work price (USD/pc)": price,
+            "Market": market,
+        })
     print(f"    SKU master: {[s['Item name'] for s in sku_master]}")
 
-    # Lane parameters (from original file or hardcoded from FGs sheet)
-    # US: 40ft=5200, 20ft=3000, LCL=200/cbm  |  UK: 40ft=4200, 20ft=2500, LCL=70/cbm (but A&B both US)
+    # ── Read BOM_demand_Scenario (weekly demand, cols A–F) ──
+    bom_df = pd.read_excel(MPS_MRP, sheet_name="BOM_demand_Scenario", header=None)
+    header = [str(bom_df.iloc[0, c]).strip() for c in range(bom_df.shape[1])]
+    week_col = header.index("Week")
+
+    # find column index for each SKU present in the header
+    sku_cols: dict[str, int] = {}
+    for sku in ALL_SKUS:
+        if sku in header:
+            sku_cols[sku] = header.index(sku)
+
+    weekly_rows: list[dict] = []
+    for r in range(1, bom_df.shape[0]):
+        wk = bom_df.iloc[r, week_col]
+        if pd.isna(wk):
+            break
+        row: dict = {"Week": pd.Timestamp(wk)}
+        for sku, col in sku_cols.items():
+            val = bom_df.iloc[r, col]
+            row[sku] = int(float(val)) if not pd.isna(val) else 0
+        weekly_rows.append(row)
+
+    print(f"    Found {len(weekly_rows)} weekly rows  "
+          f"({weekly_rows[0]['Week'].date()} -> {weekly_rows[-1]['Week'].date()})")
+
+    # ── Lane parameters (identical to solver.xlsx) ──────────
     lane_params = [
         {"Market": "US", "Mode": "40",  "Cost": 5200, "Cap_CBM": 65.0},
         {"Market": "US", "Mode": "20",  "Cost": 3000, "Cap_CBM": 28.0},
-        {"Market": "US", "Mode": "LCL", "Cost": 200,  "Cap_CBM": 99999},
+        {"Market": "US", "Mode": "LCL", "Cost": 200,  "Cap_CBM": 999999},
         {"Market": "UK", "Mode": "40",  "Cost": 4200, "Cap_CBM": 65.0},
         {"Market": "UK", "Mode": "20",  "Cost": 2500, "Cap_CBM": 28.0},
-        {"Market": "UK", "Mode": "LCL", "Cost": 70,   "Cap_CBM": 99999},
+        {"Market": "UK", "Mode": "LCL", "Cost": 70,   "Cap_CBM": 999999},
         {"Market": "AU", "Mode": "40",  "Cost": 2000, "Cap_CBM": 65.0},
         {"Market": "AU", "Mode": "20",  "Cost": 1100, "Cap_CBM": 28.0},
-        {"Market": "AU", "Mode": "LCL", "Cost": 35,   "Cap_CBM": 99999},
+        {"Market": "AU", "Mode": "LCL", "Cost": 35,   "Cap_CBM": 999999},
     ]
 
-    # Write solver_scenario.xlsx
+    # ── Write solver_scenario.xlsx ──────────────────────────
     wb = Workbook()
     ws = wb.active
-    ws.title = "Scenario_Solver"
+    ws.title = "solver"     # same sheet name as baseline
 
     r = 1
-    # ── Section 1: SKU Master ───────────────────────────────
-    ws.cell(r, 1, "SKU Master").font = BLD
+    # Title rows (like baseline)
+    ws.cell(r, 1, "Transport Cost Optimization Model (SCENARIO)").font = BLD
     r += 1
-    master_hdrs = list(sku_master[0].keys())
+    ws.cell(r, 1, "Solver-ready layout using weekly demand from BOM_demand_Scenario").font = Font(italic=True)
+    r += 2  # blank row
+
+    # Section 1 — SKU Master
+    ws.cell(r, 1, "SKU master").font = BLD
+    r += 1
+    master_hdrs = ["Item name", "Des", "Packing size (pcs/carton)",
+                   "CBM (100 cartons)", "Ex. Work price (USD/pc)", "Market"]
     for c, h in enumerate(master_hdrs, 1):
         ws.cell(r, c, h).font = BLD
     r += 1
@@ -139,8 +169,8 @@ def build_scenario_solver_xlsx():
         r += 1
 
     r += 1  # blank
-    # ── Section 2: Lane Parameters ──────────────────────────
-    ws.cell(r, 1, "Lane Parameters").font = BLD
+    # Section 2 — Lane Parameters
+    ws.cell(r, 1, "Lane parameters").font = BLD
     r += 1
     lane_hdrs = ["Market", "Mode", "Cost", "Cap_CBM"]
     for c, h in enumerate(lane_hdrs, 1):
@@ -151,93 +181,123 @@ def build_scenario_solver_xlsx():
             ws.cell(r, c, lp[k])
         r += 1
 
-    r += 1  # blank
-    # ── Section 3: Decision Table (weekly demand) ───────────
-    ws.cell(r, 1, "Decision Table (Weekly Demand by SKU)").font = BLD
-    r += 1
-    ws.cell(r, 1, "Week"); ws.cell(r, 1).font = BLD
-    ws.cell(r, 2, "A");    ws.cell(r, 2).font = BLD
-    ws.cell(r, 3, "B");    ws.cell(r, 3).font = BLD
+    r += 2  # blank rows (like baseline)
+
+    # Section 3 — Decision Table (Week, A, B, C, D, E, F)
+    ws.cell(r, 1, "Week").font = BLD
+    for ci, sku in enumerate(ALL_SKUS, 2):
+        ws.cell(r, ci, sku).font = BLD
     r += 1
     for wr in weekly_rows:
         ws.cell(r, 1, wr["Week"])
         ws.cell(r, 1).number_format = "YYYY-MM-DD"
-        ws.cell(r, 2, wr["A"])
-        ws.cell(r, 3, wr["B"])
+        for ci, sku in enumerate(ALL_SKUS, 2):
+            ws.cell(r, ci, wr.get(sku, 0))
         r += 1
 
+    auto_width(ws)
     wb.save(SCENARIO_SOLVER)
     print(f"    Saved: {SCENARIO_SOLVER.name}")
-    return weekly_rows, sku_master, lane_params
+    return SCENARIO_SOLVER
 
 
-def run_logistics(weekly_rows, sku_master, lane_params):
+# ─────────────────────────────────────────────────────────────
+#  STEP 2+3 — Run MILP solver  +  Export (reuse baseline code)
+# ─────────────────────────────────────────────────────────────
+
+def run_milp_and_export(solver_path: Path):
     """
-    Run the same MILP logic from transport_exact_global_milp.py
-    directly here for A & B.
+    Re-use the exact same build_outputs() + export_outputs() logic
+    from transport_exact_global_milp.py, but pointed at our scenario
+    solver file and writing into scenario_output/.
     """
-    print("[2/4] Running MILP transport solver for A & B ...")
+    print("[2/3] Running MILP transport solver ...")
 
-    # Import the solver
-    import sys
     sys.path.insert(0, str(BASE))
-    from transport_exact_global_milp import solve_exact_market_week
+    import transport_exact_global_milp as milp_mod
 
-    items = [s["Item name"] for s in sku_master]
-    master_df = pd.DataFrame([{
-        "Item": s["Item name"],
-        "PackSize": s["Packing size (pcs/ carton)"],
-        "CBMPerBox": s[" CBM (100 cartons) "] / 100.0,
-        "Market": s["Market "].strip().upper().replace("AUSTRALIA", "AU"),
-    } for s in sku_master])
+    # Build the outputs dict (identical structure to baseline)
+    outputs = milp_mod.build_outputs(solver_path)
 
-    lanes_df = pd.DataFrame(lane_params)
-    lanes_df["Mode"] = lanes_df["Mode"].astype(str)
+    # Export
+    print("[3/3] Exporting outputs …")
 
-    weekly_market_rows = []
-    detail_rows_all = []
+    # CSVs -> scenario_output/csv/
+    csv_dir = OUT_DIR / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_map = {
+        "US":                csv_dir / "transport_us_exact_milp.csv",
+        "UK":                csv_dir / "transport_uk_exact_milp.csv",
+        "AU":                csv_dir / "transport_au_exact_milp.csv",
+        "US_Detail":         csv_dir / "transport_us_detail_exact_milp.csv",
+        "UK_Detail":         csv_dir / "transport_uk_detail_exact_milp.csv",
+        "AU_Detail":         csv_dir / "transport_au_detail_exact_milp.csv",
+        "All_Load_Detail":   csv_dir / "transport_all_load_detail_exact_milp.csv",
+        "Weekly_All_Markets":csv_dir / "transport_weekly_all_markets_exact_milp.csv",
+        "Summary_Market":    csv_dir / "transport_summary_market_exact_milp.csv",
+        "Summary_All":       csv_dir / "transport_summary_all_exact_milp.csv",
+    }
+    for key, path in csv_map.items():
+        outputs[key].to_csv(path, index=False)
 
-    for wi, wr in enumerate(weekly_rows, 1):
-        for market in ["US", "UK", "AU"]:
-            master_mkt = master_df[master_df["Market"] == market].copy()
-            if master_mkt.empty: continue
-            lanes_mkt = lanes_df[lanes_df["Market"] == market].copy()
-            demand = {item: float(wr.get(item, 0)) for item in master_mkt["Item"].tolist()}
-
-            weekly, detail_df = solve_exact_market_week(
-                week_idx=wi, week_raw=wr["Week"],
-                market=market,
-                item_demands_units=demand,
-                master_mkt=master_mkt,
-                lane_mkt=lanes_mkt,
-            )
-            weekly_market_rows.append(weekly)
-            if not detail_df.empty:
-                detail_rows_all.append(detail_df)
-
-    weekly_all = pd.DataFrame(weekly_market_rows)
-    detail_all = pd.concat(detail_rows_all, ignore_index=True) if detail_rows_all else pd.DataFrame()
-
-    print(f"    Solved {len(weekly_rows)} weeks × {len(set(master_df['Market']))} markets")
-    return weekly_all, detail_all
-
-
-def build_monthly_cost_report(weekly_all):
-    """Build monthly logistics cost report with scenario vs baseline comparison."""
-    print("[3/4] Building monthly logistics cost report ...")
-
+    # Excel workbook -> scenario_output/  (top-level)
+    out_xlsx = OUT_DIR / "transport_output_scenario.xlsx"
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Monthly_Logistics_Cost"
+    wb.remove(wb.active)
 
-    # Add month column
+    info = wb.create_sheet("Run_Info")
+    rows = [
+        ("Input workbook", solver_path.name),
+        ("Model type", "Exact global MILP by market-week (SCENARIO)"),
+        ("Decision", "n40, n20, box allocation per container, LCL boxes"),
+        ("Objective", "Min Cost40*#40 + Cost20*#20 + CostLCL*LCL_CBM"),
+        ("Demand basis", "Demand converted from units to integer boxes by ceil(units / pack size)"),
+        ("Capacity basis", "Container limits enforced by CBM, not by box count"),
+        ("Integrality", "All box allocations and LCL boxes are integers; no fractional boxes"),
+        ("Detail output", "Each used container is listed with exact boxes by SKU; residual boxes go to LCL"),
+    ]
+    for ri, (k, v) in enumerate(rows, start=1):
+        info.cell(ri, 1).value = k
+        info.cell(ri, 2).value = v
+    for c in info["A"]:
+        c.font = Font(bold=True)
+    info.column_dimensions["A"].width = 22
+    info.column_dimensions["B"].width = 110
+
+    order = ["US", "UK", "AU",
+             "US_Detail", "UK_Detail", "AU_Detail",
+             "All_Load_Detail", "Weekly_All_Markets",
+             "Summary_Market", "Summary_All"]
+    for key in order:
+        milp_mod.write_df_sheet(wb, key, outputs[key])
+
+    wb.save(out_xlsx)
+    print(f"    -> {out_xlsx.name}")
+    print(f"    -> csv/ ({len(csv_map)} files)")
+
+    return outputs
+
+
+# ─────────────────────────────────────────────────────────────
+#  STEP 4 — Monthly cost report
+# ─────────────────────────────────────────────────────────────
+
+def build_monthly_cost_report(outputs: dict):
+    """Build monthly logistics cost report with scenario vs baseline."""
+    print("    -> monthly_logistics_cost.xlsx")
+
+    weekly_all = outputs["Weekly_All_Markets"].copy()
+
+    # Ensure Week_Date is usable
     def get_month(x):
-        if hasattr(x, "month"): return x.strftime("%Y-%m")
-        try: return pd.to_datetime(x).strftime("%Y-%m")
-        except: return "Unknown"
+        if hasattr(x, "month"):
+            return x.strftime("%Y-%m")
+        try:
+            return pd.to_datetime(x).strftime("%Y-%m")
+        except Exception:
+            return "Unknown"
 
     weekly_all["Month"] = weekly_all["Week_Date"].apply(get_month)
-    weekly_all["Week_Date_dt"] = pd.to_datetime(weekly_all["Week_Date"], errors="coerce")
 
     # Monthly summary
     monthly = (
@@ -255,7 +315,10 @@ def build_monthly_cost_report(weekly_all):
         )
     ).sort_values(["Month", "Market"])
 
-    # Sheet 1: Monthly by Market
+    wb = Workbook()
+    # ── Sheet 1: Monthly by Market ──────────────────────────
+    ws = wb.active
+    ws.title = "Monthly_Logistics_Cost"
     styled_hdr(ws, 1, [
         "Month", "Market", "Weeks", "Total CBM",
         "40ft Ctnr", "20ft Ctnr", "LCL CBM",
@@ -270,16 +333,15 @@ def build_monthly_cost_report(weekly_all):
         for ci, v in enumerate(vals, 1):
             cl = ws.cell(ri, ci, v)
             cl.border = BDR
-            if ci >= 8:  # cost columns
+            if ci >= 8:
                 cl.number_format = "$#,##0.00"
             elif ci == 4 or ci == 7:
                 cl.number_format = "0.00"
 
     # Grand total row
     ri_total = len(monthly) + 2
-    ws.cell(ri_total, 1, "GRAND TOTAL").font = BLD
+    ws.cell(ri_total, 1, "GRAND TOTAL").font = WH_B
     ws.cell(ri_total, 1).fill = ORANGE
-    ws.cell(ri_total, 1).font = WH_B
     for ci, val in enumerate([
         "", "", monthly["Weeks"].sum(), round(monthly["Total_CBM"].sum(), 2),
         monthly["n40"].sum(), monthly["n20"].sum(), round(monthly["LCL_CBM"].sum(), 2),
@@ -291,15 +353,15 @@ def build_monthly_cost_report(weekly_all):
         cl.border = BDR
         if ci >= 8:
             cl.number_format = "$#,##0.00"
-
     auto_width(ws)
     ws.freeze_panes = "A2"
 
-    # Sheet 2: Weekly detail
+    # ── Sheet 2: Weekly detail ──────────────────────────────
     ws2 = wb.create_sheet("Weekly_Detail")
-    weekly_display = weekly_all[["Month", "Market", "Week", "Week_Date",
-                                  "Total_Demand_CBM", "n40", "n20", "LCL_CBM",
-                                  "Cost_40", "Cost_20", "Cost_LCL", "Cost"]].copy()
+    cols_to_show = ["Month", "Market", "Week", "Week_Date",
+                    "Total_Demand_CBM", "n40", "n20", "LCL_CBM",
+                    "Cost_40", "Cost_20", "Cost_LCL", "Cost"]
+    weekly_display = weekly_all[cols_to_show].copy()
     styled_hdr(ws2, 1, weekly_display.columns.tolist(), NAVY)
     for ri, row in enumerate(weekly_display.itertuples(index=False), 2):
         for ci, v in enumerate(row, 1):
@@ -313,7 +375,7 @@ def build_monthly_cost_report(weekly_all):
     auto_width(ws2)
     ws2.freeze_panes = "A2"
 
-    # Sheet 3: Summary by Market
+    # ── Sheet 3: Summary by Market ──────────────────────────
     ws3 = wb.create_sheet("Summary_by_Market")
     mkt_summary = monthly.groupby("Market", as_index=False).agg(
         Total_CBM=("Total_CBM", "sum"),
@@ -334,19 +396,25 @@ def build_monthly_cost_report(weekly_all):
                 cl.number_format = "$#,##0.00"
     auto_width(ws3)
 
-    # Sheet 4: Scenario Cost Breakdown (include PCBA Air freight)
+    # ── Sheet 4: Scenario Cost Breakdown ────────────────────
     ws4 = wb.create_sheet("Scenario_Cost_Breakdown")
     styled_hdr(ws4, 1, ["Cost Category", "Amount (USD)", "Notes"], TEAL)
+
     ocean_cost = round(monthly["Total_Cost"].sum(), 2)
-    pcba_air   = 70_040.00      # from scenario analysis
+    pcba_air   = 70_040.00      # from scenario analysis (PCBA air freight for A)
+
+    us_cost  = round(monthly.loc[monthly["Market"] == "US", "Total_Cost"].sum(), 2)
+    uk_cost  = round(monthly.loc[monthly["Market"] == "UK", "Total_Cost"].sum(), 2)
+    au_cost  = round(monthly.loc[monthly["Market"] == "AU", "Total_Cost"].sum(), 2)
+
     total_scen = ocean_cost + pcba_air
 
     cost_breakdown = [
         ["--- Ocean Freight (FG Shipment) ---", "", ""],
-        ["  40ft Container cost", round(monthly["Cost_40"].sum(), 2), "A+B US market"],
-        ["  20ft Container cost", round(monthly["Cost_20"].sum(), 2), "A+B US market"],
-        ["  LCL cost", round(monthly["LCL_CBM"].sum() * 0, 2), "If any overflow"],
-        ["  Total Ocean Freight", ocean_cost, "Sum of all containers"],
+        ["  US market (A+B+F)", us_cost, "Containers + LCL"],
+        ["  UK market (C+D)", uk_cost, "Containers + LCL"],
+        ["  AU market (E)", au_cost, "Containers + LCL"],
+        ["  Total Ocean Freight", ocean_cost, "Sum of all markets"],
         ["", "", ""],
         ["--- PCBA Inbound Air Freight (Scenario) ---", "", ""],
         ["  PCBA units shipped by air", 35_020, "= 60% recovery"],
@@ -355,19 +423,16 @@ def build_monthly_cost_report(weekly_all):
         ["", "", ""],
         ["--- Total Scenario Logistics Cost ---", "", ""],
         ["  Ocean Freight", ocean_cost, "FG delivery to customers"],
-        ["  PCBA Air Freight", pcba_air, "Component inbound"],
+        ["  PCBA Air Freight", pcba_air, "Component inbound (scenario only)"],
         ["  GRAND TOTAL", total_scen, "Full scenario logistics cost"],
         ["", "", ""],
         ["--- Baseline Comparison ---", "", ""],
-        ["  Baseline ocean freight", ocean_cost, "Same (no change in shipping lanes)"],
-        ["  Baseline PCBA air", 0, "No air freight in baseline"],
-        ["  Baseline total", ocean_cost, ""],
-        ["  ADDITIONAL cost vs baseline", pcba_air, "= Scenario impact"],
-        ["  Additional cost %", "{:.1f}%".format(100 * pcba_air / ocean_cost) if ocean_cost > 0 else "N/A", ""],
+        ["  Baseline ocean freight (from solver.xlsx)", "", "Run baseline MILP separately"],
+        ["  Additional PCBA air cost", pcba_air, "= Scenario-only cost"],
     ]
 
     for ri, row in enumerate(cost_breakdown, 2):
-        bold = row[0].startswith("---") or row[0].strip().startswith("GRAND") or row[0].strip().startswith("ADDITIONAL")
+        bold = row[0].startswith("---") or "GRAND" in row[0] or "Additional" in row[0]
         for ci, v in enumerate(row, 1):
             cl = ws4.cell(ri, ci, v)
             cl.border = BDR
@@ -383,59 +448,32 @@ def build_monthly_cost_report(weekly_all):
     return monthly
 
 
+# ─────────────────────────────────────────────────────────────
+#  Main
+# ─────────────────────────────────────────────────────────────
+
 def main():
     print("=" * 60)
-    print("  SCENARIO LOGISTICS ANALYSIS")
-    print("  Source: BOM_demand_Scenario (A & B)")
+    print("  SCENARIO LOGISTICS  (A-F, US/UK/AU)")
     print("=" * 60)
 
-    # Build solver input
-    weekly_rows, sku_master, lane_params = build_scenario_solver_xlsx()
+    solver_path = build_scenario_solver_xlsx()
+    outputs = run_milp_and_export(solver_path)
+    build_monthly_cost_report(outputs)
 
-    # Run MILP
-    weekly_all, detail_all = run_logistics(weekly_rows, sku_master, lane_params)
-
-    # Monthly cost report
-    monthly = build_monthly_cost_report(weekly_all)
-
-    # Also save full transport output
-    print("[4/4] Saving transport output ...")
-    wb2 = Workbook()
-    wb2.remove(wb2.active)
-    from transport_exact_global_milp import write_df_sheet
-    for name, df in [("Weekly_All", weekly_all), ("All_Detail", detail_all)]:
-        write_df_sheet(wb2, name, df)
-
-    # Summary
-    summary = (weekly_all.groupby("Market", as_index=False)
-               .agg(Weeks=("Week","count"),
-                    Total_CBM=("Total_Demand_CBM","sum"),
-                    n40=("n40","sum"), n20=("n20","sum"),
-                    LCL_CBM=("LCL_CBM","sum"),
-                    Total_Cost=("Cost","sum")))
-    write_df_sheet(wb2, "Summary_Market", summary)
-    wb2.save(OUTPUT_XLSX)
-
+    # ── Console summary ─────────────────────────────────────
+    summary = outputs["Summary_Market"]
     print()
-    print("=" * 60)
-    print("  RESULTS")
-    print("=" * 60)
-    print()
-    print("  Market summary:")
     for _, row in summary.iterrows():
-        print("    {:>2}: CBM={:>8.1f}  40ft={:>3}  20ft={:>3}  LCL={:>7.2f}  Cost=${:>10,.2f}".format(
-            row["Market"], row["Total_CBM"],
-            int(row["n40"]), int(row["n20"]),
-            row["LCL_CBM"], row["Total_Cost"]))
-    print()
-    print("  Total ocean freight : ${:>10,.2f}".format(summary["Total_Cost"].sum()))
-    print("  PCBA air freight    : $    70,040.00")
-    print("  GRAND TOTAL         : ${:>10,.2f}".format(summary["Total_Cost"].sum() + 70040))
-    print()
-    print("  Output files:")
-    print("    -", OUTPUT_XLSX.name)
-    print("    -", MONTHLY_OUT.name)
-    print("    -", SCENARIO_SOLVER.name)
+        print("  {:>2}: CBM={:>8.1f}  40ft={:>3}  20ft={:>3}  LCL={:>7.2f}  Cost=${:>10,.2f}".format(
+            row["Market"], row["Total_Demand_CBM"],
+            int(row["Total_n40"]), int(row["Total_n20"]),
+            row["Total_LCL_CBM"], row["Total_Cost"]))
+    total_ocean = summary["Total_Cost"].sum()
+    print(f"  {'':->58}")
+    print("  Total ocean : ${:>10,.2f}".format(total_ocean))
+    print("  PCBA air    : $  70,040.00")
+    print("  GRAND TOTAL : ${:>10,.2f}".format(total_ocean + 70_040))
     print("=" * 60)
 
 
